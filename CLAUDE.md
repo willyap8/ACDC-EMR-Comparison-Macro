@@ -17,9 +17,9 @@ One-way accuracy check: compares EMR appointments against a source-of-truth mast
 - a consolidated **Bookwise** master, or
 - a consolidated **iPM** report
 
-...depending on each row's `LOCATION` value. Both sources are selected up front (two file pickers) and opened read-only; each EMR row is routed to one source (or to manual review) based on its `LOCATION` and IDs.
+...depending on each row's `LOCATION` value. The user chooses full or Bookwise-only mode up front; every selected source is opened read-only; each EMR row is routed to one source (or to manual review) based on its `LOCATION` and IDs.
 
-Current version: **v4**.
+Current version: **v5**.
 
 ## Non-negotiable rules — data integrity
 
@@ -37,7 +37,7 @@ These override any other instruction or convenience shortcut:
 - Sub names must stay stable across point releases. The QAT button binds to a specific sub name (`EMRComparisonMacro`); renaming it silently breaks the entry point for every user who already has the add-in installed.
 - Re-runs must be idempotent: column-insertion logic reuses/renames legacy columns rather than duplicating them; output/review sheets are cleared and fully rebuilt each run, not appended to.
 
-## v4-specific behaviour
+## v5 current behaviour
 
 - `Match Status` column (renamed from `Manual Review Status` in v4 — the macro renames a legacy-named column in place; if you see the old name in older code paths, treat it as legacy).
 - Clean-match labels: `"Ok - appt match bookwise"` / `"Ok - appt match iPM"`.
@@ -51,11 +51,11 @@ These override any other instruction or convenience shortcut:
 ## Hard stops (all fire before the EMR extract is touched)
 
 - Active sheet is not named `EMR Extract`.
-- Either file picker cancelled (Bookwise master or iPM report).
-- Missing required Bookwise / iPM / EMR columns, or no data rows.
+- Any picker required by the selected mode is cancelled (Bookwise master, or the iPM report in full mode).
+- Missing required Bookwise / EMR columns, or no data rows; in full mode, missing required iPM columns or data rows.
 - Duplicate `Book No.` in the Bookwise master.
-- Cancelled appointment(s) in the iPM report (`Attend Status = Cancelled`).
-- Duplicate `i.PM Schedules ID` in the iPM report.
+- In full mode, cancelled appointment(s) in the iPM report (`Attend Status = Cancelled`).
+- In full mode, duplicate `i.PM Schedules ID` in the iPM report.
 - Bookwise `Location` blank or not one of Box Hill / Maroondah / Yarra.
 
 ## Domain terms
