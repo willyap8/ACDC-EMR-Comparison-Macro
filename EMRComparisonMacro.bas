@@ -2,12 +2,12 @@ Option Explicit
 
 ' ============================================================
 '  ACDC Data Migration - EMR (Oracle Millennium) Comparison
-'  Macro  v4
+'  Macro  v5
 '
 '  Sub: EMRComparisonMacro
 '  One-way check: EMR extract validated AGAINST the consolidated
-'  Bookwise master AND the consolidated iPM report. Bookings in
-'  Bookwise/iPM missing from the EMR are NOT flagged.
+'  Bookwise master and, when selected, the consolidated iPM
+'  report. Bookings missing from the EMR are NOT flagged.
 '
 '  Deploy as an Excel Add-In (.xlam); run from a QAT button while
 '  the EMR extract is the active workbook. ActiveSheet.Parent
@@ -19,7 +19,15 @@ Option Explicit
 '    * BOTH populated             -> Manual Review, compared vs
 '                                    neither
 '
-'  ----- v4 CHANGES -------------------------------------------
+'  ----- v5 CHANGES -------------------------------------------
+'  * Opening Yes/No/Cancel choice enables the existing full
+'    comparison or a Bookwise-only run.
+'  * Otherwise-comparable iPM rows are marked SKIPPED - NOT
+'    COMPARED in Bookwise-only mode; manual-review rules retain
+'    precedence. Skips are reported and audited separately.
+'  * Bookwise-only runs rebuild the iPM mismatch sheet with a
+'    single explanatory message and never open an iPM source.
+'  ----- v4 (retained) ----------------------------------------
 '  * 'Manual Review Status' column renamed to 'Match Status'
 '    (re-run safe: reuses/renames a legacy-named column).
 '  * Clean matches labelled 'Ok - appt match bookwise' /
@@ -59,6 +67,7 @@ Public Sub EMRComparisonMacro()
     Dim idCountAcdc As Object, idCountIpm As Object
 
     Dim bookPath As String, ipmPath As String
+    Dim compareIPM As Boolean, modeResult As VbMsgBoxResult
     Dim lastRowEMR As Long, lastColEMR As Long
     Dim lastRowBook As Long, lastColBook As Long
     Dim lastRowIPM As Long, lastColIPM As Long
@@ -77,7 +86,7 @@ Public Sub EMRComparisonMacro()
     Dim runTime As Date
 
     ' Counters
-    Dim cTotal As Long, cCompBook As Long, cCompIpm As Long
+    Dim cTotal As Long, cCompBook As Long, cCompIpm As Long, cSkipIpm As Long
     Dim cClean As Long, cMismatch As Long, cUnknownID As Long
     Dim cMrTotal As Long, cMissingID As Long, cDupID As Long
     Dim cBothID As Long, cUnknLoc As Long, cStatus As Long
@@ -96,20 +105,37 @@ Public Sub EMRComparisonMacro()
     Set wsEMR = ActiveSheet
     Set wbEMR = ActiveSheet.Parent
 
-    ' 1. FILE PICKERS (both before any change) ---------------
+    ' 1. RUN MODE + FILE PICKERS (before any change) ---------
+    modeResult = MsgBox("Compare iPM appointments during this run?" & vbCrLf & vbCrLf & _
+                        "Yes = compare Bookwise and iPM" & vbCrLf & _
+                        "No = compare Bookwise only" & vbCrLf & _
+                        "Cancel = exit without making changes", _
+                        vbYesNoCancel + vbQuestion, "EMR Comparison v5 - Select Run Mode")
+    If modeResult = vbCancel Then Exit Sub
+    compareIPM = (modeResult = vbYes)
+
+    Dim bookPickerTitle As String
+    If compareIPM Then
+        bookPickerTitle = "Step 1 of 2: Select the CONSOLIDATED BOOKWISE MASTER sheet"
+    Else
+        bookPickerTitle = "Select the CONSOLIDATED BOOKWISE MASTER sheet"
+        ipmPath = "NOT SELECTED - iPM comparison disabled"
+    End If
     bookPath = Application.GetOpenFilename( _
         FileFilter:="Excel Files (*.xlsx;*.xlsm;*.xls;*.xlsb),*.xlsx;*.xlsm;*.xls;*.xlsb", _
-        Title:="Step 1 of 2: Select the CONSOLIDATED BOOKWISE MASTER sheet")
+        Title:=bookPickerTitle)
     If bookPath = "False" Then
         MsgBox "No Bookwise master selected. Macro cancelled - nothing was changed.", vbExclamation, "Cancelled"
         Exit Sub
     End If
-    ipmPath = Application.GetOpenFilename( _
-        FileFilter:="Excel Files (*.xlsx;*.xlsm;*.xls;*.xlsb),*.xlsx;*.xlsm;*.xls;*.xlsb", _
-        Title:="Step 2 of 2: Select the CONSOLIDATED iPM REPORT")
-    If ipmPath = "False" Then
-        MsgBox "No iPM report selected. Macro cancelled - nothing was changed.", vbExclamation, "Cancelled"
-        Exit Sub
+    If compareIPM Then
+        ipmPath = Application.GetOpenFilename( _
+            FileFilter:="Excel Files (*.xlsx;*.xlsm;*.xls;*.xlsb),*.xlsx;*.xlsm;*.xls;*.xlsb", _
+            Title:="Step 2 of 2: Select the CONSOLIDATED iPM REPORT")
+        If ipmPath = "False" Then
+            MsgBox "No iPM report selected. Macro cancelled - nothing was changed.", vbExclamation, "Cancelled"
+            Exit Sub
+        End If
     End If
 
     Application.ScreenUpdating = False
@@ -143,29 +169,31 @@ Public Sub EMRComparisonMacro()
         MsgBox "No booking data found in the Bookwise master 'Book No.' column.", vbExclamation, "No Bookwise Data": GoTo CleanFail
     End If
 
-    ' 3. OPEN iPM --------------------------------------------
-    Set wbIPM = Workbooks.Open(Filename:=ipmPath, ReadOnly:=True)
-    Set wsIPM = wbIPM.ActiveSheet
-    lastColIPM = wsIPM.Cells(1, wsIPM.Columns.Count).End(xlToLeft).Column
-    If lastColIPM < 1 Then
-        MsgBox "Could not read the iPM report header row (row 1).", vbCritical, "iPM Error": GoTo CleanFail
-    End If
-    ipSchedCol = FindHeaderColumn(wsIPM, "i.PM Schedules ID", 1, lastColIPM)
-    ipPatCol = FindHeaderColumn(wsIPM, "Patient Id", 1, lastColIPM)
-    ipLocCol = FindHeaderColumn(wsIPM, "Clinic Location", 1, lastColIPM)
-    ipDateCol = FindHeaderColumn(wsIPM, "Appointment Date", 1, lastColIPM)
-    ipTimeCol = FindHeaderColumn(wsIPM, "Appointment Time", 1, lastColIPM)
-    ipSessCol = FindHeaderColumn(wsIPM, "Session Code", 1, lastColIPM)
-    ipAttCol = FindHeaderColumn(wsIPM, "Attend Status", 1, lastColIPM)
-    If ipSchedCol = 0 Or ipPatCol = 0 Or ipLocCol = 0 Or ipDateCol = 0 Or _
-       ipTimeCol = 0 Or ipSessCol = 0 Or ipAttCol = 0 Then
-        MsgBox "The iPM report is missing required columns in row 1:" & vbCrLf & _
-               "  i.PM Schedules ID, Patient Id, Clinic Location, Appointment Date," & vbCrLf & _
-               "  Appointment Time, Session Code, Attend Status.", vbCritical, "Missing iPM Column": GoTo CleanFail
-    End If
-    lastRowIPM = wsIPM.Cells(wsIPM.Rows.Count, ipSchedCol).End(xlUp).Row
-    If lastRowIPM < 2 Then
-        MsgBox "No appointment data found in the iPM report 'i.PM Schedules ID' column.", vbExclamation, "No iPM Data": GoTo CleanFail
+    ' 3. OPEN iPM (full-comparison mode only) ----------------
+    If compareIPM Then
+        Set wbIPM = Workbooks.Open(Filename:=ipmPath, ReadOnly:=True)
+        Set wsIPM = wbIPM.ActiveSheet
+        lastColIPM = wsIPM.Cells(1, wsIPM.Columns.Count).End(xlToLeft).Column
+        If lastColIPM < 1 Then
+            MsgBox "Could not read the iPM report header row (row 1).", vbCritical, "iPM Error": GoTo CleanFail
+        End If
+        ipSchedCol = FindHeaderColumn(wsIPM, "i.PM Schedules ID", 1, lastColIPM)
+        ipPatCol = FindHeaderColumn(wsIPM, "Patient Id", 1, lastColIPM)
+        ipLocCol = FindHeaderColumn(wsIPM, "Clinic Location", 1, lastColIPM)
+        ipDateCol = FindHeaderColumn(wsIPM, "Appointment Date", 1, lastColIPM)
+        ipTimeCol = FindHeaderColumn(wsIPM, "Appointment Time", 1, lastColIPM)
+        ipSessCol = FindHeaderColumn(wsIPM, "Session Code", 1, lastColIPM)
+        ipAttCol = FindHeaderColumn(wsIPM, "Attend Status", 1, lastColIPM)
+        If ipSchedCol = 0 Or ipPatCol = 0 Or ipLocCol = 0 Or ipDateCol = 0 Or _
+           ipTimeCol = 0 Or ipSessCol = 0 Or ipAttCol = 0 Then
+            MsgBox "The iPM report is missing required columns in row 1:" & vbCrLf & _
+                   "  i.PM Schedules ID, Patient Id, Clinic Location, Appointment Date," & vbCrLf & _
+                   "  Appointment Time, Session Code, Attend Status.", vbCritical, "Missing iPM Column": GoTo CleanFail
+        End If
+        lastRowIPM = wsIPM.Cells(wsIPM.Rows.Count, ipSchedCol).End(xlUp).Row
+        If lastRowIPM < 2 Then
+            MsgBox "No appointment data found in the iPM report 'i.PM Schedules ID' column.", vbExclamation, "No iPM Data": GoTo CleanFail
+        End If
     End If
 
     ' 4. HARD STOPS on source files (BEFORE any EMR change) --
@@ -176,25 +204,26 @@ Public Sub EMRComparisonMacro()
                dupMsg & vbCrLf & "Resolve these before running. No changes made to any workbook.", _
                vbCritical, "Duplicate Book No. in Bookwise": GoTo CleanFail
     End If
-    ' 4b. Cancelled iPM appointment
-    Dim cancMsg As String: cancMsg = ""
-    For i = 2 To lastRowIPM
-        If StrComp(TrimText(wsIPM.Cells(i, ipAttCol).Value), "Cancelled", vbTextCompare) = 0 Then cancMsg = cancMsg & i & ", "
-    Next i
-    If Len(cancMsg) > 0 Then
-        cancMsg = Left(cancMsg, Len(cancMsg) - 2)
-        MsgBox "HARD STOP - Cancelled appointment(s) found in the iPM report." & vbCrLf & vbCrLf & _
-               "Rows with Attend Status = Cancelled:" & vbCrLf & "  " & cancMsg & vbCrLf & vbCrLf & _
-               "Remove the cancelled appointment(s) before running." & vbCrLf & _
-               "No changes have been made to any workbook.", vbCritical, "Cancelled Appointment in iPM": GoTo CleanFail
-    End If
-    ' 4c. Duplicate i.PM Schedules ID
-    dupMsg = ""
-    Set ipmDict = BuildKeyRowDict(wsIPM, ipSchedCol, 2, lastRowIPM, dupMsg)
-    If Len(dupMsg) > 0 Then
-        MsgBox "HARD STOP - Duplicate 'i.PM Schedules ID' values in the iPM report:" & vbCrLf & vbCrLf & _
-               dupMsg & vbCrLf & "Resolve these before running. No changes made to any workbook.", _
-               vbCritical, "Duplicate i.PM Schedules ID in iPM": GoTo CleanFail
+    ' 4b/4c. iPM hard stops and dictionary (full mode only)
+    If compareIPM Then
+        Dim cancMsg As String: cancMsg = ""
+        For i = 2 To lastRowIPM
+            If StrComp(TrimText(wsIPM.Cells(i, ipAttCol).Value), "Cancelled", vbTextCompare) = 0 Then cancMsg = cancMsg & i & ", "
+        Next i
+        If Len(cancMsg) > 0 Then
+            cancMsg = Left(cancMsg, Len(cancMsg) - 2)
+            MsgBox "HARD STOP - Cancelled appointment(s) found in the iPM report." & vbCrLf & vbCrLf & _
+                   "Rows with Attend Status = Cancelled:" & vbCrLf & "  " & cancMsg & vbCrLf & vbCrLf & _
+                   "Remove the cancelled appointment(s) before running." & vbCrLf & _
+                   "No changes have been made to any workbook.", vbCritical, "Cancelled Appointment in iPM": GoTo CleanFail
+        End If
+        dupMsg = ""
+        Set ipmDict = BuildKeyRowDict(wsIPM, ipSchedCol, 2, lastRowIPM, dupMsg)
+        If Len(dupMsg) > 0 Then
+            MsgBox "HARD STOP - Duplicate 'i.PM Schedules ID' values in the iPM report:" & vbCrLf & vbCrLf & _
+                   dupMsg & vbCrLf & "Resolve these before running. No changes made to any workbook.", _
+                   vbCritical, "Duplicate i.PM Schedules ID in iPM": GoTo CleanFail
+        End If
     End If
     ' 4d. Bookwise Location populated + valid
     Dim blankLocMsg As String, badLocMsg As String, bn As String, lv As String
@@ -280,9 +309,14 @@ Public Sub EMRComparisonMacro()
     wsMis.Rows(1).Font.Bold = True
 
     Set wsIMis = SetupSheetClear(wbEMR, "iPM Mismatches to Review")
-    For i = 1 To lastColIPM: wsIMis.Cells(1, i).Value = SafeText(wsIPM.Cells(1, i).Value): Next i
-    wsIMis.Cells(1, lastColIPM + 1).Value = "Dt/Tm Added by Macro"
-    wsIMis.Rows(1).Font.Bold = True
+    If compareIPM Then
+        For i = 1 To lastColIPM: wsIMis.Cells(1, i).Value = SafeText(wsIPM.Cells(1, i).Value): Next i
+        wsIMis.Cells(1, lastColIPM + 1).Value = "Dt/Tm Added by Macro"
+        wsIMis.Rows(1).Font.Bold = True
+    Else
+        wsIMis.Cells(1, 1).Value = "iPM appointments not compared this run by macro"
+        wsIMis.Cells(1, 1).Font.Bold = True
+    End If
 
     Set wsUnk = SetupSheetClear(wbEMR, "EMR Appt Unkn ID")
     For i = 1 To nSrc: wsUnk.Cells(1, i).Value = SafeText(wsEMR.Cells(1, srcCols(i)).Value): Next i
@@ -358,10 +392,15 @@ Public Sub EMRComparisonMacro()
                 mrnColE, locColE, dateColE, timeColE, acdcColE, ipmColE, _
                 bkUrCol, bkDateCol, bkTimeCol, bkLocCol, lastColBook, runTime, cClean, cMismatch, cUnknownID
         ElseIf locCat = "iPM" Then
-            cCompIpm = cCompIpm + 1
-            CompareIPMRow wsEMR, wsIPM, wsIMis, wsUnk, r, ipmid, loc, mrCol, ipmDict, srcCols, _
-                mrnColE, locColE, dateColE, timeColE, acdcColE, ipmColE, _
-                ipPatCol, ipDateCol, ipTimeCol, ipLocCol, ipSessCol, lastColIPM, runTime, cClean, cMismatch, cUnknownID
+            If compareIPM Then
+                cCompIpm = cCompIpm + 1
+                CompareIPMRow wsEMR, wsIPM, wsIMis, wsUnk, r, ipmid, loc, mrCol, ipmDict, srcCols, _
+                    mrnColE, locColE, dateColE, timeColE, acdcColE, ipmColE, _
+                    ipPatCol, ipDateCol, ipTimeCol, ipLocCol, ipSessCol, lastColIPM, runTime, cClean, cMismatch, cUnknownID
+            Else
+                wsEMR.Cells(r, mrCol).Value = "SKIPPED - NOT COMPARED"
+                cSkipIpm = cSkipIpm + 1
+            End If
         End If
 
 NextEMRRow:
@@ -372,8 +411,10 @@ NextEMRRow:
     lastRowMis = wsMis.Cells(wsMis.Rows.Count, 1).End(xlUp).Row
     GreyColumns wsMis, 1, lastRowMis, 1, lastColBook, Array(bkBookCol, bkUrCol, bkDateCol, bkTimeCol, bkLocCol)
 
-    lastRowIMis = wsIMis.Cells(wsIMis.Rows.Count, 1).End(xlUp).Row
-    GreyColumns wsIMis, 1, lastRowIMis, 1, lastColIPM, Array(ipSchedCol, ipPatCol, ipDateCol, ipTimeCol, ipLocCol, ipSessCol)
+    If compareIPM Then
+        lastRowIMis = wsIMis.Cells(wsIMis.Rows.Count, 1).End(xlUp).Row
+        GreyColumns wsIMis, 1, lastRowIMis, 1, lastColIPM, Array(ipSchedCol, ipPatCol, ipDateCol, ipTimeCol, ipLocCol, ipSessCol)
+    End If
 
     lastRowUnk = wsUnk.Cells(wsUnk.Rows.Count, 1).End(xlUp).Row
     GreyUnknownSheet wsUnk, srcCols, lastRowUnk, _
@@ -401,17 +442,22 @@ NextEMRRow:
         .Cells(aRow, 14).Value = cBothID
         .Cells(aRow, 15).Value = cUnknLoc
         .Cells(aRow, 16).Value = cStatus
+        .Cells(aRow, 17).Value = cSkipIpm
     End With
     wsAudit.Protect DrawingObjects:=True, Contents:=True, Scenarios:=True
 
     ' 11. CLOSE SOURCES + SUMMARY ----------------------------
     wbBook.Close SaveChanges:=False: Set wbBook = Nothing
-    wbIPM.Close SaveChanges:=False: Set wbIPM = Nothing
+    If compareIPM Then
+        wbIPM.Close SaveChanges:=False
+        Set wbIPM = Nothing
+    End If
 
-    MsgBox "EMR Comparison Complete (v4)" & vbCrLf & vbCrLf & _
+    MsgBox "EMR Comparison Complete (v5)" & vbCrLf & vbCrLf & _
            "Total EMR rows processed:  " & cTotal & vbCrLf & vbCrLf & _
            "Bookwise rows compared:    " & cCompBook & vbCrLf & _
            "iPM rows compared:         " & cCompIpm & vbCrLf & _
+           "iPM rows skipped:          " & cSkipIpm & vbCrLf & _
            "   Clean matches:          " & cClean & vbCrLf & _
            "   Mismatches:             " & cMismatch & vbCrLf & _
            "   Unknown IDs:            " & cUnknownID & vbCrLf & vbCrLf & _
@@ -420,7 +466,7 @@ NextEMRRow:
            "   Duplicate ID:    " & cDupID & vbCrLf & _
            "   Both IDs Present: " & cBothID & vbCrLf & _
            "   Unknown Location: " & cUnknLoc & vbCrLf & _
-           "   Status:          " & cStatus, vbInformation, "Comparison Summary - v4"
+           "   Status:          " & cStatus, vbInformation, "Comparison Summary - v5"
 
     GoTo CleanExit
 
@@ -844,10 +890,13 @@ Public Function GetOrCreateAuditSheet(wb As Workbook) As Worksheet
     Const AUDIT_NAME As String = "Reconcile Audit Log"
     Dim ws As Worksheet, s As Worksheet
     For Each s In wb.Worksheets
-        If s.Name = AUDIT_NAME Then Set GetOrCreateAuditSheet = s: Exit Function
+        If s.Name = AUDIT_NAME Then Set ws = s: Exit For
     Next s
-    Set ws = wb.Worksheets.Add(After:=wb.Worksheets(wb.Worksheets.Count))
-    ws.Name = AUDIT_NAME: ws.Visible = xlSheetVisible
+    If ws Is Nothing Then
+        Set ws = wb.Worksheets.Add(After:=wb.Worksheets(wb.Worksheets.Count))
+        ws.Name = AUDIT_NAME: ws.Visible = xlSheetVisible
+    End If
+    ws.Unprotect
     With ws
         .Cells(1, 1).Value = "Run Date/Time": .Cells(1, 2).Value = "Run By (Username)"
         .Cells(1, 3).Value = "Bookwise File Path": .Cells(1, 4).Value = "iPM File Path"
@@ -857,6 +906,7 @@ Public Function GetOrCreateAuditSheet(wb As Workbook) As Worksheet
         .Cells(1, 11).Value = "Manual Review Total": .Cells(1, 12).Value = "Missing ID"
         .Cells(1, 13).Value = "Duplicate ID": .Cells(1, 14).Value = "Both IDs Present"
         .Cells(1, 15).Value = "Unknown Location": .Cells(1, 16).Value = "Status"
+        .Cells(1, 17).Value = "iPM Rows Skipped"
         .Rows(1).Font.Bold = True
         .Columns(1).NumberFormat = "dd/mm/yyyy hh:mm:ss": .Columns(1).ColumnWidth = 20
         .Columns(2).ColumnWidth = 22: .Columns(3).ColumnWidth = 60: .Columns(4).ColumnWidth = 60
@@ -864,4 +914,3 @@ Public Function GetOrCreateAuditSheet(wb As Workbook) As Worksheet
     ws.Protect DrawingObjects:=True, Contents:=True, Scenarios:=True
     Set GetOrCreateAuditSheet = ws
 End Function
-
